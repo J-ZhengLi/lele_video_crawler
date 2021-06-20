@@ -1,5 +1,7 @@
 /ffmpeg.exe
 /ffprobe.exe
 /Output
-/STT.json
+video_list.txt
 /TEMP
+/Test
+/Out

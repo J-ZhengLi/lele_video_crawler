@@ -1,22 +1,25 @@
 #import cv2
-import os, datetime
-import ffmpeg, srt, subprocess
+import os, datetime, json, subprocess
+import ffmpeg, srt
+from google.cloud.speech_v1.services.speech import client
 from google.cloud import speech
+#from google.protobuf.json_format import MessageToJson
 
 class VideoConverter:
-    def __init__(self, src='', output_folder='Output'):
-        self.src = src
-        self.src_basename = os.path.basename(src) if src else ''
-        self.des_folder = output_folder
+    def __init__(self, src='', output_dir=''):
+        self.setSrc(src)
+        self.des_dir = output_dir if output_dir else os.path.dirname(src)
         self.supported_video_output_format = dict([('mp4', 'h264')])
         self.video_temp = []
         self.clip_temp = []
         self.audio_temp = []
         self.srt_temp = []
+        self.sst_temp = []  # save speech recognition result to avoid extra cost
         self.video_list_file = 'video_list.txt'
 
     def setSrc(self, src):
         self.src = src
+        self.src_basename = os.path.basename(src) if src else ''
 
     # TODO: Abandon ffmpeg model, use subprocess call ffmpeg command instead
     def convertTo(self, src='', video_type='mp4', bit_rate=0):
@@ -34,6 +37,16 @@ class VideoConverter:
         else:
             video.output(des).run()
             return 1
+
+    def extract_audio(self, input='', output_dir='', extension='wav', channel=1, sample_rate=16000):
+        if not input: input = self.src
+        output = output_dir + '/' + os.path.basename(input) + '.' + extension
+        if not os.path.isfile(output):
+            print(f'正在将{os.path.basename(input)}转换为音频格式...')
+            self.audio_temp.append(output)
+            subprocess.run(['ffmpeg','-i',input,'-v','error','-ac',str(channel),'-ar',str(sample_rate),'-vn',output])
+        else:
+            print(f'文件{os.path.basename(output)}已经存在')
 
     """
     " OpenCV Region
@@ -84,47 +97,57 @@ class VideoConverter:
         cap.release()
         writer.release()
     """
+    
+    def split_video(self, input='', output_folder='', video_length=0, sec_limit=0):
+        """ 分割视频
+        "   return 分割后的视频片段路径
+        "   input: 输入文件路径,默认为该类的src
+        "   output_folder: 分割后视频存放目录，默认为/TEMP
+        "   sec_limit: 每个视频最大时长
+        """
 
-    # return a list of splitted video_paths
-    def split_video(self, input='', output_folder='TEMP', sec_limit=0):
         if not input: input = self.src
+        if not output_folder: output_folder = os.path.dirname(self.src) + '/TEMP'
         if sec_limit == 0: return [input]
 
         res = []
         base_command = ['ffmpeg','-i', input, '-v', 'quiet']
-        self.video_list_file = output_folder + '/' + self.video_list_file
 
-        # get video length
-        duration = subprocess.run(f'ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{input}"', 
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT)
-        duration = float(duration.stdout)
+        # get video length if not provided
+        if video_length == 0:
+            duration = subprocess.run(f'ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{input}"', 
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT)
+            video_length = float(duration.stdout)
 
         # make sure output folder is ready
-        if not os.path.isdir(output_folder): os.makedirs(os.getcwd() + '/' + output_folder)
+        if not os.path.isdir(output_folder): os.makedirs(output_folder)
         
-        if duration < sec_limit: return [input]
+        if video_length < sec_limit: return [input]
 
         start_sec = 0
-        for i in range(int(duration / sec_limit) + 1):
-            if start_sec == duration: break
+        for i in range(int(video_length / sec_limit) + 1):
+            if start_sec == video_length: break
 
-            end_sec = (start_sec + sec_limit) if start_sec + sec_limit < duration else duration
+            end_sec = (start_sec + sec_limit) if start_sec + sec_limit < video_length else video_length
             src_path_arr = self.src_basename.rsplit('.', 1)
             file_path = output_folder + '/' + src_path_arr[0] + '_' + str(i+1) + '.' + src_path_arr[1]
             res.append(file_path)
+
             if not os.path.isfile(file_path):
                 print(f'正在将视频剪辑为从{start_sec}秒到{end_sec}秒的片段')
                 out_command = base_command + ['-ss', str(start_sec), '-to', str(end_sec), '-c', 'copy', file_path]
                 subprocess.run(out_command)
-                self.video_temp.append(file_path)
 
             start_sec = end_sec
+
+        self.video_temp = res
         return res
 
-    def transcript_video(self, videopath):
+    def __local_transcript(self, videopath='', subtitle_duration=3):
         # if already has subtitle file skip speech recognition
         subtitle_path = videopath.rsplit('.', 1)[0] + '.srt'
+
         if not os.path.isfile(subtitle_path):
             # prepare speech recognition google api
             client = speech.SpeechClient()
@@ -132,7 +155,7 @@ class VideoConverter:
                 encoding = speech.RecognitionConfig.AudioEncoding.LINEAR16,
                 language_code = 'zh-CN',
                 sample_rate_hertz = 16000,
-                #enable_automatic_punctuation=True,
+                enable_automatic_punctuation=True,
                 enable_word_time_offsets=True
             )
 
@@ -148,24 +171,61 @@ class VideoConverter:
             audio = speech.RecognitionAudio(content=content)
             print('正在使用谷歌API进行语音识别中...')
             response = client.recognize(request={"config": config, "audio": audio})
-            self.generate_subtitle(response.results, 4, fileName=subtitle_path)
+            self.generate_subtitle(response.results, subtitle_duration, fileName=subtitle_path)
+        
+        outputPath = videopath.rsplit('.', 1)[0] + '_sub.mp4'
+        if not os.path.isfile(outputPath):
+            self.combineSubtitles(subtitle_path, videopath, outputPath)
+        else:
+            print('嵌有字幕的视频片段已存在，跳过')
 
-        # embedding subtitle to video
-        self.combineSubtitles(subtitle_path, videopath)
-        '''
-        for result in response.results:
-            # First alternative is the most probable result
-            alternative = result.alternatives[0]
-            print(alternative.transcript)
+    def __cloud_transcript(self, audioURI='', subtitle_duration=3):
+        # prepare output file container
+        subtitle_path = audioURI.split('/', 3)[-1] + '.srt'
+        if not os.path.isdir(os.path.dirname(subtitle_path)):
+            os.makedirs(os.path.dirname(subtitle_path))
 
-            for word_info in alternative.words:
-                word = word_info.word
-                start_time = word_info.start_time
-                end_time = word_info.end_time
-                print(f"Word: {word}, start_time: {start_time.total_seconds()}, end_time: {end_time.total_seconds()}")
-        '''
+        if not os.path.isfile(subtitle_path):
+            # no subtitle file, request speech recognition api
+            client = speech.SpeechClient()
+            config = speech.RecognitionConfig(
+                encoding = speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                language_code = 'zh-CN',
+                sample_rate_hertz = 16000,
+                enable_automatic_punctuation=True,
+                enable_word_time_offsets=True
+            )
+
+
+    def transcript_video(self, link='', split=False, subtitle_duration=3):
+        if not link: link = self.src
+
+        # Check video length
+        duration = subprocess.run(f'ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{input}"', 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT)
+        video_length = float(duration.stdout)
+
+        if video_length < 60:
+            # use local transcription method directly
+            self.__local_transcript(link, subtitle_duration)
+        elif video_length >= 60 and split:
+            # split into partial videos with duration less than 1 minute, and than use local transcription method
+            split_v = self.split_video(link, video_length=video_length, sec_limit=58)
+            for v in split_v:
+                self.__local_transcript(v, subtitle_duration)
+        else:
+            # use cloud transcription method
+            self.__cloud_transcript(link, subtitle_duration)
 
     def generate_subtitle(self, text_result, bin_size=3, fileName='sub.srt'):
+        """ 生成字幕文件
+        "   return None
+        "   text_result: 语音识别后的的结果
+        "   bin_size: 对应subtitle_duration, 规定每行字幕最大显示时长，默认3秒
+        "   fileName: 输出字幕文件路径
+        """
+
         transcriptions = []
         index = 0
     
@@ -180,11 +240,10 @@ class VideoConverter:
                     start_sec = 0
                     start_microsec = 0 
                 end_sec = start_sec + bin_size # bin end sec
-                end_microsec = start_microsec + bin_size
                 
                 # for last word of result
                 last_word_end_sec = result.alternatives[0].words[-1].end_time.seconds
-                last_word_end_microsec = result.alternatives[0].words[-1].end_time.microseconds * 0.001
+                last_word_end_microsec = result.alternatives[0].words[-1].end_time.microseconds
                 
                 # bin transcript
                 transcript = result.alternatives[0].words[0].word
@@ -195,34 +254,34 @@ class VideoConverter:
                     try:
                         word = result.alternatives[0].words[i + 1].word
                         word_start_sec = result.alternatives[0].words[i + 1].start_time.seconds
-                        word_start_microsec = result.alternatives[0].words[i + 1].start_time.microseconds * 0.001 # 0.001 to convert nana -> micro
+                        word_start_microsec = result.alternatives[0].words[i + 1].start_time.microseconds
                         word_end_sec = result.alternatives[0].words[i + 1].end_time.seconds
-                        word_end_microsec = result.alternatives[0].words[i + 1].end_time.microseconds * 0.001
 
                         if word_end_sec < end_sec:
                             transcript += word
                         else:
                             previous_word_end_sec = result.alternatives[0].words[i].end_time.seconds
-                            previous_word_end_microsec = result.alternatives[0].words[i].end_time.microseconds * 0.001
+                            previous_word_end_microsec = result.alternatives[0].words[i].end_time.microseconds
                             
                             # append bin transcript
-                            transcriptions.append(srt.Subtitle(index, datetime.timedelta(0, start_sec, start_microsec), datetime.timedelta(0, previous_word_end_sec, previous_word_end_microsec), transcript))
+                            line = srt.Subtitle(index, datetime.timedelta(seconds=start_sec, microseconds=start_microsec), datetime.timedelta(seconds=previous_word_end_sec, microseconds=previous_word_end_microsec), transcript)
+                            transcriptions.append(line)
                             
                             # reset bin parameters
                             start_sec = word_start_sec
                             start_microsec = word_start_microsec
                             end_sec = start_sec + bin_size
-                            end_microsec = start_microsec + bin_size
                             transcript = result.alternatives[0].words[i + 1].word
                             
                             index += 1
-                    except IndexError:
-                        print('Error when proccessing subtitles')
+                    except IndexError as ie:
+                        print('生成字幕时发生错误: ' + ie)
+
                 # append transcript of last transcript in bin
-                transcriptions.append(srt.Subtitle(index, datetime.timedelta(0, start_sec, start_microsec), datetime.timedelta(0, last_word_end_sec, last_word_end_microsec), transcript))
+                transcriptions.append(srt.Subtitle(index, datetime.timedelta(seconds=start_sec, microseconds=start_microsec), datetime.timedelta(seconds=last_word_end_sec, microseconds=last_word_end_microsec), transcript))
                 index += 1
-            except IndexError:
-                print('Error when transcripting video')
+            except IndexError as ie:
+                print('准备生成字幕对象时出错:' + ie)
         
         # turn transcription list into subtitles
         subtitles = srt.compose(transcriptions)
@@ -231,12 +290,12 @@ class VideoConverter:
         print('已生成字幕文件, 文件路径: ' + fileName)
         self.srt_temp.append(fileName)
 
-    def combineSubtitles(self, subtitle_path='', video_path=''):
+    def combineSubtitles(self, subtitle_path='', video_path='', output_path=''):
         if not video_path:
             video_path = self.src
             subtitle_path = self.src.rsplit('.', 1)[0] + '.srt'
 
-        output_path = video_path.rsplit('.', 1)[0] + '_sub.mp4'
+        if not output_path: output_path = video_path.rsplit('.', 1)[0] + '_sub.mp4'
         self.clip_temp.append(output_path)
 
         if not os.path.isfile(output_path):
@@ -246,14 +305,17 @@ class VideoConverter:
             print('带字幕视频文件已存在, 跳过')
 
         with open(self.video_list_file, 'a', encoding='utf8') as v_list:
-            v_list.write(f"file '{os.path.basename(output_path)}'\n")
+            v_list.write(f"file '{output_path}'\n")
 
-    def combineVideos(self):
-        if os.path.isfile(self.video_list_file):
-            output_path = os.path.dirname(self.video_list_file)
-            output_fp = output_path + '/' + os.path.basename(self.src)
+    def combineVideos(self, video_list_fp=''):
+        if not video_list_fp: video_list_fp = self.video_list_file
+        if os.path.isfile(video_list_fp):
+            fn_temp = self.src.rsplit('.', 1)
+            output_fp = fn_temp[0] + '_subbed.' + fn_temp[1]
             print('正在将视频片段合成...')
-            subprocess.run(['ffmpeg','-f','concat','-i',self.video_list_file,'-v','error','-codec','copy',output_fp])
+            subprocess.run(['ffmpeg','-f','concat','-i',video_list_fp,'-v','error','-codec','copy',output_fp])
+        else:
+            print('缺少需合成的文件列表')
 
     def clear_temp_except(self, *temp_to_keep):
         print('正在清理临时文件...')
@@ -261,26 +323,50 @@ class VideoConverter:
         if 'video' not in temp_to_keep:
             for v in self.video_temp:
                 if os.path.isfile(v): os.remove(v)
+            self.video_temp = []
         if 'audio' not in temp_to_keep:
             for a in self.audio_temp:
                 if os.path.isfile(a): os.remove(a)
+            self.audio_temp = []
         if 'subtitle' not in temp_to_keep:
             for s in self.srt_temp:
                 if os.path.isfile(s): os.remove(s)
+            self.srt_temp = []
         if 'clip' not in temp_to_keep:
             for c in self.clip_temp:
                 if os.path.isfile(c): os.remove(c)
+            self.clip_temp = []
         if 'list' not in temp_to_keep:
             if os.path.isfile(self.video_list_file): os.remove(self.video_list_file)
 
 def main():
-    vc = VideoConverter('Test/22351.mp4')
-    file_list = vc.split_video(sec_limit=58)
-    for f in file_list:
-        vc.transcript_video(f)
-    vc.combineVideos()
-    vc.clear_temp_except('subtitle')
-    
+    #vc = VideoConverter('gs://lele-vid-stt-storage/高中数学/高中必修1/二分法/21137.mp4')
+    #vc.cloud_transcript()
+    #file_list = vc.split_video(sec_limit=58)
+    #for f in file_list:
+    #    vc.transcript_video(f, 4)
+    #vc.combineVideos()
+    #vc.clear_temp_except('subtitle', 'clip')
+    count = 0
+    vc = VideoConverter()
+    for root,_,files in os.walk('Test/高中数学'):
+        for f in files:
+            #if count >= 1: return
+            file_path = (root + '/' + f).replace('\\', '/')
+            #print(file_path)
+            #print(file_path.replace('\\', '/'))
+            vc.setSrc(file_path)
+            #splitted_fp = vc.split_video(sec_limit=58)
+            #for s_fp in splitted_fp:
+            #    vc.transcript_video(s_fp, 4)
+            #vc.combineVideos()
+            #vc.clear_temp_except('subtitle', 'clip')
+            out_dir = 'Out/' + os.path.dirname(file_path)
+            if not os.path.isdir(out_dir):
+                os.makedirs(out_dir)
+            vc.extract_audio(output_dir=out_dir)
+            count += 1
+    print(count)
 
 if __name__ == '__main__':
     main()
