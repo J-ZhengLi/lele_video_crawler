@@ -1,6 +1,7 @@
 #import cv2
 import os, datetime, json, subprocess
 import ffmpeg, srt
+from google.api_core import operation
 from google.cloud.speech_v1.services.speech import client
 from google.cloud import speech
 #from google.protobuf.json_format import MessageToJson
@@ -195,6 +196,9 @@ class VideoConverter:
                 enable_automatic_punctuation=True,
                 enable_word_time_offsets=True
             )
+
+            audio = speech.RecognitionAudio(uri=audioURI)
+            response = client.long_running_recognize(config=config, audio=audio)
 
 
     def transcript_video(self, link='', split=False, subtitle_duration=3):
