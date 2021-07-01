@@ -19,6 +19,8 @@ class VideoFactory:
         self.audio_temp = []
         self.srt_temp = []
 
+        self.splitted = False
+
     def setSrc(self, src):
         """
         设置输入文件（夹）路径
@@ -83,7 +85,10 @@ class VideoFactory:
             print('音频声道不支持.')
             return
 
-        output = output_dir + os.path.basename(src) + '.' + extension
+        temp_path = os.path.relpath(src).rsplit('\\', 1)
+        output_dir += temp_path[0]
+        if not os.path.isdir(output_dir): os.makedirs(output_dir)
+        output = output_dir + '/' + temp_path[1] + '.' + extension
         if os.path.isfile(output):
             print(f'路径下的文件({output})已经存在, 自动跳过')
             return
@@ -95,6 +100,7 @@ class VideoFactory:
             command += ['-vn',output]
 
         print(f'正在从{src}提取音频...')
+        #print(output)
         subprocess.run(command)
         self.audio_temp.append(output)
 
@@ -199,11 +205,13 @@ class VideoFactory:
             start_sec = end_sec
 
         self.video_temp = res
+        self.splitted = True
         return res
 
     def __local_transcript(self, videopath='', subtitle_duration=3):
         # if already has subtitle file skip speech recognition
         subtitle_path = videopath.rsplit('.', 1)[0] + '.srt'
+        self.srt_temp.append(subtitle_path)
 
         if not os.path.isfile(subtitle_path):
             # prepare speech recognition google api
@@ -236,9 +244,12 @@ class VideoFactory:
         else:
             print('嵌有字幕的视频片段已存在，跳过')
 
+        return subtitle_path
+
     def __cloud_transcript(self, audioURI='', subtitle_duration=3):
         # prepare output file container
         subtitle_path = audioURI.split('/', 3)[-1].rsplit('.', 1)[0]  + '.srt'
+        self.srt_temp.append(subtitle_path)
 
         if not os.path.isdir(os.path.dirname(subtitle_path)):
             os.makedirs(os.path.dirname(subtitle_path))
@@ -267,9 +278,10 @@ class VideoFactory:
         else:
             print('字幕文件已存在, 无需调用API转录')
         
-        videopath = 'Test/' + subtitle_path.rsplit('.', 1)[0]
-        outputPath = subtitle_path.rsplit('.', 2)[0] + '_sub.mp4'
-        self.combineSubtitles(subtitle_path, videopath, outputPath)
+        return subtitle_path
+        #videopath = 'Test/' + subtitle_path.rsplit('.', 1)[0]
+        #outputPath = subtitle_path.rsplit('.', 2)[0] + '_sub.mp4'
+        #self.combineSubtitles(subtitle_path, videopath, outputPath)
 
     def transcript_video(self, src='', output_dir='', isGCS=False, subtitle_duration=3):
         """
@@ -284,20 +296,27 @@ class VideoFactory:
             该文件路径是否为Google Cloud Storage(谷歌云)路径, 如果为本地路径请保持默认值
         subtitle_duration : int
             转录后每行字幕显示的时间秒数, 默认3秒
+        -------------------------------------
+        return
+        res : list<tuple(str, str)>
+            原视频路径以及字幕文件路径, 便于后期合并
         """
 
         if not src: src = self.src
-        if not output_dir: output_dir = os.path.dirname(self.src) + '/output'
-        if not os.path.isdir(output_dir): os.makedirs(output_dir)
+        #if not output_dir: output_dir = os.path.dirname(self.src) + '/output'
+        #if not os.path.isdir(output_dir): os.makedirs(output_dir)
 
         if isGCS:
-            self.__cloud_transcript(src, subtitle_duration)
+            return [(src, self.__cloud_transcript(src, subtitle_duration))]
         else:
             # split video to make sure it is less than 1 minute
             # use 58 seconds instead of 60 to make sure
+            res = []
             splitted_paths = self.split_video(src, sec_limit=58)
             for sp in splitted_paths:
-                self.__local_transcript(sp, subtitle_duration)
+                sub_path = self.__local_transcript(sp, subtitle_duration)
+                res.append((sp, sub_path))
+            return res
 
     def generate_subtitle(self, text_result, bin_size=3, fileName='sub.srt'):
         """ 生成字幕文件
@@ -369,16 +388,24 @@ class VideoFactory:
         with open(fileName, 'w', encoding='utf8') as f:
             f.writelines(subtitles)
         print('已生成字幕文件, 文件路径: ' + fileName)
-        self.srt_temp.append(fileName)
 
-    def combineSubtitles(self, subtitle_path='', video_path='', output_path=''):
-        if not video_path:
-            video_path = self.src
-            subtitle_path = self.src.rsplit('.', 1)[0] + '.srt'
+    def combineSubtitles(self, subtitle_path, video_path='', output_dir=''):
+        """
+        将字幕嵌入视频
+        --------------
+        args
+        subtitle_path : str
+            输入的字幕文件路径, 不得为空
+        video_path : str
+            输入的视频文件路径, 若留空则默认为此类的src
+        output_dir : str
+            输出文件夹路径, 默认和输入视频文件目录相同
+        """
+        if not video_path: video_path = self.src
+        if not output_dir: output_dir = os.path.dirname(video_path)
+        if self.splitted: self.clip_temp.append(output_dir)
 
-        if not output_path: output_path = video_path.rsplit('.', 1)[0] + '_sub.mp4'
-        self.clip_temp.append(output_path)
-
+        output_path = output_dir + '/' + os.path.basename(video_path).rsplit('.', 1)[0] + '_sub.mp4'
         if not os.path.isfile(output_path):
             print('正在嵌入字幕到视频片段中...')
             subprocess.call(['ffmpeg', '-i', video_path, '-v', 'error', '-vf', 'subtitles='+subtitle_path, output_path])
@@ -435,12 +462,14 @@ class VideoFactory:
             if os.path.isfile(self.video_list_file): os.remove(self.video_list_file)
 
 # ------------------------- END OF CLASS ---------------------------
-'''
+
 lock = threading.Lock()
 vc = VideoFactory()
 def thread_task(filepath):
-    vc.cloud_transcript(filepath, 4)
-    vc.clear_temp_except('subtitle', 'clip')
+    #lock.acquire()
+    vc.transcript_video(filepath, isGCS=True, subtitle_duration=4)
+    #vc.clear_temp('text')
+    #lock.release()
 
 def get_videopaths(folder_path):
     count = 0
@@ -463,22 +492,30 @@ def multithread_transcript(input_queue, thread_count=20, timeout_sec=10):
             t.start()
             threads.append(t)
         else:
+            print('等待中...')
             time.sleep(timeout_sec)
 
     for thread in threads:
         thread.join()
 
+# set GOOGLE_APPLICATION_CREDENTIALS=F:/STT.json
 
 def main():
-    #res = get_videopaths('Test/高中数学')
-    fileQueue = Queue()
+    #res = get_videopaths('Test/初中数学')
+    #fileQueue = Queue()
     with open('transcript_list.txt', 'r', encoding='utf8') as file:
         for line in file.readlines():
-            file_path = 'gs://lele-vid-stt-storage/' + line.strip().split('/', 1)[1] + '.wav'
+            video_path = line.strip()
+            file_path = 'gs://lele-vid-stt-storage/' + video_path.split('/', 1)[1] + '.wav'
+
             #fileQueue.put(file_path)
-            vc.cloud_transcript(file_path, 4)
-            vc.clear_temp_except('subtitle', 'clip')
+            (_, srt_file) = vc.transcript_video(file_path, True, 4)[0]
+            output_path = srt_file.rsplit('/', 1)[0]
+            #print(output_path)
+            vc.combineSubtitles(srt_file, video_path, output_path)
+            #vc.clear_temp_except('subtitle', 'clip')
+
+    #multithread_transcript(fileQueue)
 
 if __name__ == '__main__':
     main()
-'''
